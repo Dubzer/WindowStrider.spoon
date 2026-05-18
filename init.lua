@@ -7,15 +7,37 @@ local obj = {}
 obj.__index = obj
 
 obj.name = "WindowStrider"
-obj.version = "1.0"
+obj.version = "2.2"
 obj.author = "Dubzer"
 obj.license = "MIT"
+
+require("hs.axuielement")
 
 local log = hs.logger.new("WindowStrider")
 local prettyAlert = dofile(hs.spoons.resourcePath("prettyAlert.lua"))
 local formatHotkey = dofile(hs.spoons.resourcePath("formatHotkey.lua"))
 
-local tinsert, tsort = table.insert, table.sort
+local delayLogThreshold = 0.03
+local tinsert = table.insert
+
+---@alias BundleID string
+---@alias BundleIDList BundleID[]
+
+---@class WindowEntry
+---@field id number
+---@field window hs.window
+---@field groupKey string|nil
+---@field isTabbed boolean|nil
+
+---@class TabGroupCacheEntry
+---@field tabCount integer|nil
+---@field windowCount integer
+
+---@alias TabGroupCache table<string, TabGroupCacheEntry>
+
+---@class TargetListStats
+---@field tabScanCount integer
+---@field tabScanTime number
 
 -- keep references to listeners to avoid getting garbage collected
 local _keep = {}
@@ -27,21 +49,170 @@ local function keep(it)
     return it
 end
 
-local function wf_getWindowList(self, reverse)
+---@param apps BundleIDList
+---@return table<BundleID, boolean>
+local function appSetFor(apps)
+    local appSet = {}
+    for _, app in ipairs(apps) do
+        appSet[app] = true
+    end
+    return appSet
+end
+
+---@param apps BundleIDList
+---@return WindowEntry[]
+local function getWindowEntriesWithTabGroups(apps)
+    ---@type WindowEntry[]
     local r = {}
-    for window, _ in pairs(self.windows) do
-        tinsert(r, window)
+
+    if #apps == 0 then return r end
+
+    for _, bundleID in ipairs(apps) do
+        for _, application in ipairs(hs.application.applicationsForBundleID(bundleID)) do
+            ---@type WindowEntry[]
+            local windowEntries = {}
+
+            for _, window in ipairs(application:allWindows()) do
+                if window:isStandard() then
+                    local id = window:id()
+                    if id then
+                        tinsert(windowEntries, {
+                            id = id,
+                            window = window,
+                        })
+                    end
+                end
+            end
+
+            if #windowEntries == 1 then
+                tinsert(r, windowEntries[1])
+            elseif #windowEntries > 1 then
+                for _, entry in ipairs(windowEntries) do
+                    local frame = entry.window:frame()
+                    entry.groupKey = ("%s:%s,%s,%s,%s"):format(application:pid(), frame.x, frame.y, frame.w, frame.h)
+                    tinsert(r, entry)
+                end
+            end
+        end
     end
-    if reverse then
-        tsort(r, function(a, b)
-            return a.timeFocused < b.timeFocused
-        end)
-    else
-        tsort(r, function(a, b)
-            return a.timeFocused > b.timeFocused
-        end)
-    end
+
     return r
+end
+
+-- note: AXUIElement API is slow
+---@param window hs.window
+---@return integer|nil
+local function fetchWindowTabCount(window)
+    local element = hs.axuielement.windowElement(window)
+    if not element then return nil end
+
+    local children = element:attributeValue("AXChildren")
+    if not children then return nil end
+
+    for _, child in ipairs(children) do
+        if child:attributeValue("AXRole") == "AXTabGroup" then
+            local tabGroupChildren = child:attributeValue("AXChildren")
+            if not tabGroupChildren then return nil end
+            return #tabGroupChildren
+        end
+    end
+end
+
+---@param apps BundleIDList
+---@param tabGroupCache TabGroupCache
+---@param reverse boolean
+---@return WindowEntry[] windows
+---@return TargetListStats stats
+local function getTargetList(apps, tabGroupCache, reverse)
+    ---@type TargetListStats
+    local stats = {
+        tabScanCount = 0,
+        tabScanTime = 0,
+    }
+
+    local windows = getWindowEntriesWithTabGroups(apps)
+    ---@type table<string, WindowEntry[]>
+    local groups = {}
+
+    for _, w in ipairs(windows) do
+        if w.groupKey then
+            local group = groups[w.groupKey]
+            if not group then
+                group = {}
+                groups[w.groupKey] = group
+            end
+            tinsert(group, w)
+        end
+    end
+
+    ---@type table<number, true>
+    local ignoredWindowIds = {}
+
+    for _, group in pairs(groups) do
+        if #group > 1 then
+            local activeEntry = group[1]
+            local cached = tabGroupCache[activeEntry.groupKey]
+            local tabCount = nil
+
+            if cached and cached.tabCount and cached.tabCount >= #group then
+                tabCount = cached.tabCount
+            elseif cached and cached.windowCount == #group then
+                tabCount = cached.tabCount
+            else
+                local scanStart = hs.timer.secondsSinceEpoch()
+
+                tabCount = fetchWindowTabCount(activeEntry.window)
+
+                stats.tabScanTime = stats.tabScanTime + hs.timer.secondsSinceEpoch() - scanStart
+                stats.tabScanCount = stats.tabScanCount + 1
+
+                tabGroupCache[activeEntry.groupKey] = {
+                    tabCount = tabCount,
+                    windowCount = #group,
+                }
+            end
+
+            -- basically ignore all tabs except the first one
+            -- to avoid cycling between tabs in the same window
+            if tabCount and tabCount >= #group then
+                group[1].isTabbed = true
+                for index = 2, #group do
+                    ignoredWindowIds[group[index].id] = true
+                end
+            end
+        end
+    end
+
+    local visibleWindows = {}
+    for _, w in ipairs(windows) do
+        if not ignoredWindowIds[w.id] then
+            tinsert(visibleWindows, w)
+        end
+    end
+
+    if reverse then
+        local reversed = {}
+        for index = #visibleWindows, 1, -1 do
+            tinsert(reversed, visibleWindows[index])
+        end
+        return reversed, stats
+    end
+
+    return visibleWindows, stats
+end
+
+---@param w WindowEntry
+local function focusWindow(w)
+    if w.isTabbed then
+        w.window:raise()
+        local application = w.window:application()
+        if application then
+            application:activate(false)
+            return
+        end
+    end
+
+    w.window:focus()
 end
 
 ---@class CycleState
@@ -72,26 +243,13 @@ function CycleState:add(windowId)
     end
 end
 
---- @param apps table
---- @return function cycleWindows
+---@param apps BundleIDList
+---@return fun() cycleWindows
 local function createWindowSwitcher(apps)
-    local filter = keep(hs.window.filter.new(function(window)
-        local application = window:application()
-        if not application then return false end
-        local bundleID = application:bundleID()
-        for _, app in ipairs(apps) do
-            if bundleID == app and window:isStandard() then
-                return true
-            end
-        end
-        return false
-    end))
-
+    local appSet = appSetFor(apps)
+    ---@type TabGroupCache
+    local tabGroupCache = {}
     local cycleState = CycleState.new()
-
-    -- force wf to populate its internal list of windows
-    ---@diagnostic disable-next-line: undefined-field
-    filter:keepActive()
 
     return function()
         local starttime = hs.timer.secondsSinceEpoch()
@@ -102,9 +260,11 @@ local function createWindowSwitcher(apps)
         end
 
         local focusedApp = focused and focused:application()
-        local cycling = focusedApp and hs.fnutils.contains(apps, focusedApp:bundleID())
+        local cycling = focusedApp and appSet[focusedApp:bundleID()] == true
 
-        local windows = wf_getWindowList(filter, cycleState.reversed)
+        local targetListStart = hs.timer.secondsSinceEpoch()
+        local windows, targetListStats = getTargetList(apps, tabGroupCache, cycleState.reversed)
+        local targetListTime = hs.timer.secondsSinceEpoch() - targetListStart
 
         -- launch the app if no windows are found
         if #windows == 0 then
@@ -112,14 +272,13 @@ local function createWindowSwitcher(apps)
             return
         end
 
+        local focusedId = focused and focused:id()
         if cycling then
-            local focusedId = focused:id()
             assert(focusedId ~= nil)
-
             cycleState:add(focusedId)
 
             -- wrap around if we've visited all windows
-            if cycleState.count == #windows then
+            if cycleState.count >= #windows then
                 cycleState:reset()
                 cycleState:add(focusedId)
                 cycleState.reversed = true
@@ -128,11 +287,17 @@ local function createWindowSwitcher(apps)
             cycleState:reset()
         end
 
+        local focusTime = 0
+
         -- find first unvisited window
         for _, w in ipairs(windows) do
             if cycleState.visited[w.id] == nil then
-                if not focused or w.id ~= focused:id() then
-                    w.window:focus()
+                if not focused or w.id ~= focusedId then
+                    local focusStart = hs.timer.secondsSinceEpoch()
+
+                    focusWindow(w)
+
+                    focusTime = hs.timer.secondsSinceEpoch() - focusStart
                 end
                 cycleState:add(w.id)
                 break
@@ -140,16 +305,23 @@ local function createWindowSwitcher(apps)
         end
 
         local timeTaken = hs.timer.secondsSinceEpoch() - starttime
-        if timeTaken > 0.03 then
-            log.d("long time taken: " .. timeTaken)
+        if timeTaken > delayLogThreshold then
+            log.w(("delay: %.1fms total, %.1fms target list, %.1fms focus, %.1fms ax (%d), %d targets"):format(
+                timeTaken * 1000,
+                targetListTime * 1000,
+                focusTime * 1000,
+                targetListStats.tabScanTime * 1000,
+                targetListStats.tabScanCount,
+                #windows
+            ))
         end
     end
 end
 
 --- Binds a hotkey to switch between windows of the specified applications.
---- @param mods table The modifiers for the hotkey (e.g., {"option"})
---- @param key string The key for the hotkey (e.g., "2")
---- @param apps table A list of application bundle IDs (e.g., {"com.brave.Browser"})
+---@param mods string[] The modifiers for the hotkey (e.g., {"option"})
+---@param key string The key for the hotkey (e.g., "2")
+---@param apps BundleIDList A list of application bundle IDs (e.g., {"com.brave.Browser"})
 function obj:bindHotkey(mods, key, apps)
     local cycleWindows = createWindowSwitcher(apps)
     keep(hs.hotkey.bind(mods, key, cycleWindows))
@@ -159,11 +331,13 @@ end
 --- Binds a hotkey for dynamic app pinning.
 --- When pressed with the record modifier, pins the currently focused app.
 --- When pressed without, cycles through windows of the pinned app.
---- @param mods table The base modifiers for the hotkey (e.g., {"option"})
---- @param key string The key for the hotkey (e.g., "1")
---- @param recordMod string Additional modifier for recording (e.g., "shift")
+---@param mods string[] The base modifiers for the hotkey (e.g., {"option"})
+---@param key string The key for the hotkey (e.g., "1")
+---@param recordMod string Additional modifier for recording (e.g., "shift")
 function obj:bindPinHotkey(mods, key, recordMod)
+    ---@type BundleID|nil
     local pinnedBundleID = nil
+    ---@type fun()|nil
     local cycleWindows = nil
 
     local recordModifiers = {}
