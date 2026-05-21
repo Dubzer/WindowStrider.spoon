@@ -4,6 +4,10 @@ this is my [Hammerspoon](https://www.hammerspoon.org/) script that i use daily t
 
 the goal of my setup is to imprint the window switching into the muscle memory and make it effortless, **so i don't have to think about it**
 
+<p align="center">
+<video src="https://github.com/user-attachments/assets/412adec0-9031-4aa3-8add-d4568e633036"></video>
+</p>
+
 to achieve this, WindowStrider allows you to bind applications to specific hotkeys and switch between their windows instantly
 
 ```lua
